@@ -322,3 +322,82 @@ export class UsersService {
 -  Идиоматичность NestJS: Использует стандартные паттерны NestJS (декораторы, перехватчики) и Node.js (AsyncLocalStorage).
 
 Это надежное и масштабируемое решение для управления транзакциями в NestJS с Prisma.
+
+## Диагностика
+
+### 1. Прямая проверка this:
+
+В геттере PrismaService.client, когда store отсутствует, сделайте следующую проверку:
+
+```ts
+    // src/prisma/prisma.service.ts
+    // ...
+    get client(): PrismaClient | Prisma.TransactionClient {
+      const store = prismaClientContext.getStore();
+      if (store) {
+        console.log('PrismaService.client: Using transaction client');
+        return store;
+      }
+      console.log('PrismaService.client: Using default Prisma client');
+      
+      // *** ГЛАВНАЯ ПРОВЕРКА ***
+      if (this instanceof PrismaClient) {
+          console.log('PrismaService.client: "this" IS an instance of PrismaClient.');
+          // Проверим, есть ли у него свойство 'user' и является ли оно объектом/геттером
+          if (this.user && typeof this.user === 'object') {
+              console.log('PrismaService.client: "this.user" property exists and is an object.');
+              // Проверим, есть ли у this.user метод findUnique
+              if (typeof this.user.findUnique === 'function') {
+                  console.log('PrismaService.client: "this.user.findUnique" is a function. All good!');
+              } else {
+                  console.error('PrismaService.client ERROR: "this.user.findUnique" is NOT a function, it is:', typeof this.user.findUnique, this.user);
+              }
+          } else {
+              console.error('PrismaService.client ERROR: "this.user" property is missing or not an object:', this.user);
+          }
+      } else {
+          console.error('PrismaService.client ERROR: "this" is NOT an instance of PrismaClient! Actual type:', this.constructor.name, this);
+      }
+
+      return this;
+    }
+```
+### 2.  Замена return this; на явный PrismaClient (тест):
+
+В качестве временного диагностического теста, попробуйте в геттере client создать новый экземпляр PrismaClient или получить его как-то иначе, если this не работает:
+
+```ts
+    // src/prisma/prisma.service.ts
+    // ...
+    // ВНИМАНИЕ: Это только для диагностики! Не оставлять в продакшене без тщательного обдумывания.
+    // Если проблема в "this", этот подход может помочь обойти ее для не-транзакционных вызовов.
+    let _fallbackPrismaClient: PrismaClient;
+
+    get client(): PrismaClient | Prisma.TransactionClient {
+      const store = prismaClientContext.getStore();
+      if (store) {
+        console.log('PrismaService.client: Using transaction client');
+        return store;
+      }
+      console.log('PrismaService.client: Using default Prisma client');
+
+      // Диагностический тест:
+      // Если this не работает, попробуйте использовать отдельный экземпляр PrismaClient
+      if (!this.user || typeof this.user.findUnique !== 'function') {
+          console.error('PrismaService.client: "this" is not functioning as PrismaClient. Attempting fallback.');
+          if (!_fallbackPrismaClient) {
+              _fallbackPrismaClient = new PrismaClient();
+              _fallbackPrismaClient.$connect().then(() => console.log('Fallback PrismaClient connected.')).catch(e => console.error('Fallback PrismaClient connection error:', e));
+              // Добавим hook для $disconnect при завершении приложения для _fallbackPrismaClient
+              // Но это может усложнить обработку жизненного цикла.
+          }
+          return _fallbackPrismaClient; // Возвращаем запасной клиент
+      }
+
+      return this;
+    }
+```
+
+Если с этим _fallbackPrismaClient все работает, значит, проблема точно в том, что сам экземпляр PrismaService (this) теряет функциональность PrismaClient, когда он возвращается из геттера client. Это указывает на глубокую проблему с наследованием или инициализацией PrismaClient внутри PrismaService.
+
+Скорее всего, проблема кроется в тонкостях наследования PrismaClient или в том, как NestJS инициализирует PrismaService в определенном контексте (не транзакционном). Детальная отладка с проверкой this должна прояснить ситуацию.
