@@ -111,9 +111,10 @@ import {
   Logger,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { Observable, throwError } from 'rxjs';
+import { Observable, throwError, from, lastValueFrom } from 'rxjs'; // Добавляем 'from' и 'lastValueFrom'
 import { catchError } from 'rxjs/operators';
-import { TRANSACTIONAL_KEY, PrismaService } from '../../prisma/prisma.service'; // Adjust path as needed
+import { TRANSACTIONAL_KEY } from '../decorators/transactional.decorator'; // Корректный путь к декоратору
+import { PrismaService } from '../../prisma/prisma.service'; // Корректный путь к PrismaService
 
 @Injectable()
 export class PrismaTransactionInterceptor implements NestInterceptor {
@@ -124,7 +125,7 @@ export class PrismaTransactionInterceptor implements NestInterceptor {
     private readonly reflector: Reflector,
   ) {}
 
-  async intercept(context: ExecutionContext, next: CallHandler): Promise<Observable<any>> {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
     const isTransactional = this.reflector.getAllAndOverride<boolean>(
       TRANSACTIONAL_KEY,
       [context.getHandler(), context.getClass()],
@@ -137,34 +138,27 @@ export class PrismaTransactionInterceptor implements NestInterceptor {
 
     this.logger.debug('Starting database transaction...');
 
-    // Оборачиваем выполнение оригинального метода в транзакцию Prisma
-    return new Observable(subscriber => {
-      this.prismaService.transaction(async (tx) => {
-        // Внутри этого блока AsyncLocalStorage будет содержать 'tx'.
-        // Таким образом, все вызовы 'prismaService.client' внутри 'next.handle()'
-        // будут использовать этого клиента транзакции.
-        try {
-          // Выполняем оригинальный метод сервиса.
-          // Если он асинхронный, toPromise() дождется его завершения.
-          const result = await next.handle().toPromise();
-          this.logger.debug('Transaction committed successfully.');
-          subscriber.next(result); // Отправляем результат подписчику
-          subscriber.complete();   // Завершаем Observable
-        } catch (error) {
-          // Если в методе произошла ошибка, Prisma автоматически выполнит ROLLBACK,
-          // так как мы находимся внутри `$transaction` callback.
-          this.logger.error(`Transaction rolled back due to error: ${error.message}`, error.stack);
-          subscriber.error(error); // Отправляем ошибку подписчику
-        }
-      }).catch(error => {
-        // Обработка ошибок, которые могли произойти на уровне самой транзакции (например, проблемы с соединением).
-        this.logger.error(`Failed to execute transaction: ${error.message}`, error.stack);
-        subscriber.error(error);
-      });
-    }).pipe(
+    // Оборачиваем выполнение оригинального метода в транзакцию Prisma.
+    // `prismaService.transaction` возвращает Promise, который мы оборачиваем в Observable с помощью `from`.
+    return from(this.prismaService.transaction(async (tx) => {
+      try {
+        // `lastValueFrom` конвертирует Observable, возвращаемый `next.handle()`, в Promise.
+        // Это эквивалентно поведению `toPromise()` в данном контексте.
+        const result = await lastValueFrom(next.handle());
+        this.logger.debug('Transaction committed successfully.');
+        return result; // Возвращаем результат, который станет значением Promise и затем Observable.
+      } catch (error) {
+        // Если в методе произошла ошибка, Prisma автоматически выполнит ROLLBACK,
+        // так как мы находимся внутри `$transaction` callback.
+        this.logger.error(`Transaction rolled back due to error: ${error.message}`, error.stack);
+        throw error; // Re-throw, чтобы ошибка была перехвачена внешним catchError или обработана Prisma.
+      }
+    })).pipe(
+      // Обработка ошибок, которые могли произойти на уровне самой транзакции
+      // (например, проблемы с соединением или ошибки, выброшенные из callback).
       catchError((error) => {
-        // Дальнейшая обработка ошибок, если нужно (например, преобразование в HttpError)
-        return throwError(() => error);
+        this.logger.error(`Failed to execute transaction: ${error.message}`, error.stack);
+        return throwError(() => error); // Пробрасываем ошибку дальше в цепочку NestJS.
       })
     );
   }
