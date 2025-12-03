@@ -402,7 +402,8 @@ export class UsersService {
 
 Скорее всего, проблема кроется в тонкостях наследования PrismaClient или в том, как NestJS инициализирует PrismaService в определенном контексте (не транзакционном). Детальная отладка с проверкой this должна прояснить ситуацию.
 
-ChatGPT | Midjourney | Nano Banana, [3 дек. 2025 в 12:18]
+# Без интерцептора и декоратора
+
 Вы абсолютно правы! Если AOP-механизмы кажутся слишком сложными (а они действительно добавляют уровень абстракции и когнитивной нагрузки), и проблема в интерцепторе, то давайте найдем решение без интерцептора и декоратора @Transactional.
 
 Это сделает код немного менее "магическим" и более явным, но при этом сохранит принцип AsyncLocalStorage для неявной передачи клиента транзакции.
@@ -413,16 +414,17 @@ ChatGPT | Midjourney | Nano Banana, [3 дек. 2025 в 12:18]
 
 ---
 
-▌Шаг 1: Убираем декоратор и интерцептор
+### Шаг 1: Убираем декоратор и интерцептор
 
 •  Удаляем файл src/common/decorators/transactional.decorator.ts.
 •  Удаляем файл src/common/interceptors/prisma-transaction.interceptor.ts.
 •  Из src/app.module.ts удаляем PrismaTransactionInterceptor из providers и APP_INTERCEPTOR.
 •  Из src/prisma/prisma.service.ts удаляем TRANSACTIONAL_KEY и Reflector из импортов, если они были.
 
-▌Шаг 2: PrismaService остается почти таким же
+### Шаг 2: PrismaService остается почти таким же
 
 Он будет отвечать за хранение AsyncLocalStorage и предоставление геттера client.
+```ts
 // src/prisma/prisma.service.ts
 import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient, Prisma } from '@prisma/client';
@@ -488,16 +490,17 @@ export class PrismaService extends PrismaClient implements OnModuleInit, OnModul
     return !!(this as any).user && typeof (this as any).user.findUnique === 'function';
   }
 }
+```
 
 Важное замечание по get client():
 Тот факт, что this не работает как PrismaClient в не-транзакционном контексте, когда он является экземпляром PrismaService, но работает как tx (клиент транзакции), указывает на глубокую проблему с тем, как PrismaService наследует PrismaClient или как NestJS его инициализирует.
 Создание new PrismaClient() каждый раз, когда нет транзакции, — это КОСТЫЛЬ. Он будет работать, но создаст новые пулы соединений и увеличит накладные расходы. Идеальное решение — устранить корневую причину, почему this не является полноценным PrismaClient. Возможно, это ошибка в вашей версии Prisma/NestJS/Node.js, или какая-то специфическая конфигурация.
 Однако, если вам нужно срочное и рабочее решение без AOP, этот костыль может временно помочь, пока вы не найдете корневую проблему.
 
-▌Шаг 3: Использование в сервисах
+### Шаг 3: Использование в сервисах
 
 Теперь вместо @Transactional() вы будете явно вызывать this.prismaService.transaction() в тех методах сервиса, которые должны быть транзакционными.
-
+```ts
 // src/user/user.service.ts
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { UsersRepository } from './users.repository';
@@ -550,11 +553,12 @@ export class UsersService {
     return this.usersRepository.findUserById(id);
   }
 }
+```
 
 ### Шаг 4: Репозитории остаются прежними
 
 Репозитории по-прежнему используют this.prisma.client, который прозрачно переключается между обычным PrismaClient и клиентом транзакции.
-
+```ts
 // src/users/users.repository.ts
 import { Injectable } from '@nestjs/common';
 import { User, Prisma } from '@prisma/client';
@@ -574,18 +578,18 @@ export class UsersRepository {
 
   // ... другие методы ...
 }
-
+```
 ---
 
-▌Плюсы этого подхода (без интерцептора и декоратора):
+### Плюсы этого подхода (без интерцептора и декоратора):
 
-•   Простота: Нет AOP, нет метаданных, нет Reflector, нет интерцепторов.
-•   Явность: Вы явно видите, где начинается и заканчивается транзакция.
-•   Контроль: Вы полностью контролируете логику транзакции в вашем сервисе.
+-   Простота: Нет AOP, нет метаданных, нет Reflector, нет интерцепторов.
+-   Явность: Вы явно видите, где начинается и заканчивается транзакция.
+-   Контроль: Вы полностью контролируете логику транзакции в вашем сервисе.
 
-▌Минусы:
+### Минусы:
 
-•   Больше шаблонного кода: Каждый транзакционный метод сервиса должен будет содержать блок return this.prismaService.transaction(async (txClient) => { ... });.
-•   Меньшая "магия": Нет автоматического оборачивания по декоратору.
+-   Больше шаблонного кода: Каждый транзакционный метод сервиса должен будет содержать блок return this.prismaService.transaction(async (txClient) => { ... });.
+-   Меньшая "магия": Нет автоматического оборачивания по декоратору.
 
 Этот подход является рабочим, понятным и не зависит от сложного взаимодействия интерцепторов и AOP. Если проблема с this в PrismaService.client (в не-транзакционном контексте) продолжает быть актуальной, то предложенный костыль с new PrismaClient() внутри геттера client будет обходить эту конкретную проблему, но настоятельно рекомендую все-таки найти её корень.
