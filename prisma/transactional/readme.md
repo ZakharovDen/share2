@@ -423,3 +423,169 @@ ChatGPT | Midjourney | Nano Banana, [3 дек. 2025 в 12:18]
 ▌Шаг 2: PrismaService остается почти таким же
 
 Он будет отвечать за хранение AsyncLocalStorage и предоставление геттера client.
+// src/prisma/prisma.service.ts
+import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { PrismaClient, Prisma } from '@prisma/client';
+import { AsyncLocalStorage } from 'async_hooks';
+
+export const prismaClientContext = new AsyncLocalStorage<Prisma.TransactionClient>();
+
+@Injectable()
+export class PrismaService extends PrismaClient implements OnModuleInit, OnModuleDestroy {
+  constructor() {
+    super();
+  }
+
+  async onModuleInit() {
+    await this.$connect();
+  }
+
+  async onModuleDestroy() {
+    await this.$disconnect();
+  }
+
+  // Этот геттер по-прежнему будет универсальной точкой доступа
+  get client(): PrismaClient | Prisma.TransactionClient {
+    const store = prismaClientContext.getStore();
+    if (store) {
+      console.log('PrismaService.client: Using transaction client');
+      return store;
+    }
+    console.log('PrismaService.client: Using default Prisma client');
+    // Мы знаем, что "this" как PrismaClient вызывает проблему в не-транзакционном контексте.
+    // Давайте вернемся к диагностике:
+    // Если `this` не работает, это означает, что базовая инициализация PrismaClient сломалась.
+    // Если она сломалась, то проблема не в транзакциях, а в том, как PrismaService
+    // extends PrismaClient.
+    // Для временного обхода, если проблема ТОЛЬКО здесь, можно использовать:
+    if (!this._hasPrismaClientMethods()) { // Введем эту вспомогательную функцию для проверки
+        console.warn('PrismaService.client: Default PrismaClient (this) is not fully initialized. Falling back to a new instance for non-transactional use. THIS IS A TEMPORARY WORKAROUND.');
+        // Это костыль, который нужно заменить на исправление корневой проблемы.
+        // Корневая проблема: почему "this" не работает как PrismaClient без транзакции.
+        return new PrismaClient(); // Создаем новый экземпляр, если 'this' сломан.
+                                  // Это создаст новый пул соединений. Не идеально, но работает.
+    }
+    return this;
+  }
+
+  // Метод для запуска новой транзакции (остается таким же)
+  async transaction<T>(callback: (tx: Prisma.TransactionClient) => Promise<T>): Promise<T> {
+    return this.$transaction(async (tx) => {
+      return prismaClientContext.run(tx, async () => {
+        return callback(tx);
+      });
+    });
+  }
+
+  async enableShutdownHooks(app: INestApplication) {
+    this.$on('beforeExit', async () => {
+      await app.close();
+    });
+  }
+
+  // Вспомогательная функция для проверки, что this имеет методы PrismaClient
+  private _hasPrismaClientMethods(): boolean {
+    return !!(this as any).user && typeof (this as any).user.findUnique === 'function';
+  }
+}
+
+Важное замечание по get client():
+Тот факт, что this не работает как PrismaClient в не-транзакционном контексте, когда он является экземпляром PrismaService, но работает как tx (клиент транзакции), указывает на глубокую проблему с тем, как PrismaService наследует PrismaClient или как NestJS его инициализирует.
+Создание new PrismaClient() каждый раз, когда нет транзакции, — это КОСТЫЛЬ. Он будет работать, но создаст новые пулы соединений и увеличит накладные расходы. Идеальное решение — устранить корневую причину, почему this не является полноценным PrismaClient. Возможно, это ошибка в вашей версии Prisma/NestJS/Node.js, или какая-то специфическая конфигурация.
+Однако, если вам нужно срочное и рабочее решение без AOP, этот костыль может временно помочь, пока вы не найдете корневую проблему.
+
+▌Шаг 3: Использование в сервисах
+
+Теперь вместо @Transactional() вы будете явно вызывать this.prismaService.transaction() в тех методах сервиса, которые должны быть транзакционными.
+
+// src/user/user.service.ts
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { UsersRepository } from './users.repository';
+import { PrismaService } from '../prisma/prisma.service'; // Импортируем PrismaService
+
+@Injectable()
+export class UsersService {
+  constructor(
+    private readonly usersRepository: UsersRepository,
+    private readonly prismaService: PrismaService, // Инжектируем PrismaService
+  ) {}
+
+  // Этот метод будет выполнять транзакционные операции
+  async createUserAndProfile(userData: { name: string; email: string }, profileData: { bio: string }) {
+    console.log('Service: Starting createUserAndProfile (explicit transactional)');
+
+    // Явно запускаем транзакцию
+    return this.prismaService.transaction(async (txClient) => {
+      // Все операции внутри этого callback'а будут использовать txClient,
+      // потому что PrismaService.client будет возвращать txClient из AsyncLocalStorage.
+
+      const user = await this.usersRepository.createUser(userData);
+      console.log(`Service: User created with ID: ${user.id}`);
+
+      // Имитация другой операции, которая должна быть в той же транзакции
+      // Например, создание профиля, связанного с пользователем
+      // Предположим, у вас есть другой репозиторий для профилей или метод в UsersRepository
+      // await this.profileRepository.createProfile({ ...profileData, userId: user.id });
+
+      // Имитация ошибки для проверки отката транзакции
+      if (userData.email === 'error@example.com') {
+        console.error('Service: Simulating an error to trigger rollback.');
+        throw new InternalServerErrorException('Simulated error during profile creation.');
+      }
+
+      // Еще одна операция в той же транзакции
+      await this.usersRepository.updateUser({
+        where: { id: user.id },
+        data: { name: `${user.name} (Updated)` },
+      });
+      console.log(`Service: User ${user.id} updated within the same transaction.`);
+
+      return user;
+    }); // Конец транзакции
+  }
+
+  // Этот метод не будет использовать транзакцию.
+  async findUserById(id: number) {
+    console.log('Service: Finding user by ID (non-transactional)');
+    return this.usersRepository.findUserById(id);
+  }
+}
+
+### Шаг 4: Репозитории остаются прежними
+
+Репозитории по-прежнему используют this.prisma.client, который прозрачно переключается между обычным PrismaClient и клиентом транзакции.
+
+// src/users/users.repository.ts
+import { Injectable } from '@nestjs/common';
+import { User, Prisma } from '@prisma/client';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class UsersRepository {
+  constructor(private readonly prisma: PrismaService) {}
+
+  async createUser(data: Prisma.UserCreateInput): Promise<User> {
+    return this.prisma.client.user.create({ data });
+  }
+
+  async findUserById(id: number): Promise<User | null> {
+    return this.prisma.client.user.findUnique({ where: { id } });
+  }
+
+  // ... другие методы ...
+}
+
+---
+
+▌Плюсы этого подхода (без интерцептора и декоратора):
+
+•   Простота: Нет AOP, нет метаданных, нет Reflector, нет интерцепторов.
+•   Явность: Вы явно видите, где начинается и заканчивается транзакция.
+•   Контроль: Вы полностью контролируете логику транзакции в вашем сервисе.
+
+▌Минусы:
+
+•   Больше шаблонного кода: Каждый транзакционный метод сервиса должен будет содержать блок return this.prismaService.transaction(async (txClient) => { ... });.
+•   Меньшая "магия": Нет автоматического оборачивания по декоратору.
+
+Этот подход является рабочим, понятным и не зависит от сложного взаимодействия интерцепторов и AOP. Если проблема с this в PrismaService.client (в не-транзакционном контексте) продолжает быть актуальной, то предложенный костыль с new PrismaClient() внутри геттера client будет обходить эту конкретную проблему, но настоятельно рекомендую все-таки найти её корень.
