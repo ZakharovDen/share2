@@ -593,3 +593,128 @@ export class UsersRepository {
 -   Меньшая "магия": Нет автоматического оборачивания по декоратору.
 
 Этот подход является рабочим, понятным и не зависит от сложного взаимодействия интерцепторов и AOP. Если проблема с this в PrismaService.client (в не-транзакционном контексте) продолжает быть актуальной, то предложенный костыль с new PrismaClient() внутри геттера client будет обходить эту конкретную проблему, но настоятельно рекомендую все-таки найти её корень.
+
+Ага! Вот оно что! Это очень важная деталь, которая объясняет проблему с this в не-транзакционном контексте.
+
+Вы используете PrismaPg адаптер. В этом случае, когда вы вызываете super({ adapter }), вы передаете конфигурацию, которая изменяет способ работы базового PrismaClient.
+
+Проблема заключается в следующем:
+
+1. super({ adapter }) не делает this полностью инициализированным PrismaClient немедленно.
+  Когда вы делаете extends PrismaClient и передаете конфигурацию в super(), PrismaClient требует асинхронной инициализации для установки соединения и готовности к запросам. Эта инициализация происходит, когда вы вызываете this.$connect() (что вы делаете в onModuleInit).
+
+2. PrismaService.client геттер вызывается раньше, чем onModuleInit завершается в некоторых случаях.
+  •  Когда вы запускаете приложение, PrismaService инстанциируется.
+  •  Его конструктор super({ adapter }) вызывается.
+  •  Затем NestJS вызывает onModuleInit(), где вы делаете await this.$connect().
+  •  Однако, если какой-то код пытается получить this.prismaService.client ДО того, как onModuleInit завершил await this.$connect(), то this еще не будет полностью готов. У него не будет инициализированных прокси-объектов user, post и т.д., потому что $connect еще не выполнился.
+
+3. Транзакционный клиент (tx) работает, потому что он создается "по запросу".
+  Когда вы вызываете this.$transaction(async (tx) => { ... }), Prisma сама создает tx (клиент транзакции), который уже готов к работе. Он не зависит от состояния this как дефолтного клиента.
+
+Решение этой проблемы (и устранение костыля):
+
+Вместо того чтобы полагаться на this как на PrismaClient напрямую, мы должны гарантировать, что PrismaClient всегда используется только после его полной инициализации.
+
+Лучший подход в NestJS с extends PrismaClient и адаптерами:
+
+1. Удаляем extends PrismaClient из PrismaService.
+2. Делаем PrismaService оберткой для PrismaClient.
+  Это устраняет проблемы наследования и явных вызовов super().
+
+---
+
+▌Обновленный PrismaService (без наследования PrismaClient):
+
+// src/prisma/prisma.service.ts
+import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg'; // Импортируем адаптер
+import { AsyncLocalStorage } from 'async_hooks';
+import { Pool } from 'pg'; // Если PrismaPg требует, обычно Pool
+
+export const prismaClientContext = new AsyncLocalStorage<Prisma.TransactionClient>();
+
+@Injectable()
+export class PrismaService implements OnModuleInit, OnModuleDestroy {
+  // Теперь PrismaClient будет внутренним свойством
+  private prisma: PrismaClient;
+
+  constructor() {
+    // Создаем экземпляр PrismaClient здесь, используя адаптер
+    // Убедитесь, что DATABASE_URL корректен
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error('DATABASE_URL is not set.');
+    }
+    const pool = new Pool({ connectionString }); // PrismaPg может потребовать явно Pool
+    const adapter = new PrismaPg(pool); // Создаем адаптер
+    
+    this.prisma = new PrismaClient({
+      adapter,
+      // Можно добавить другие опции, например, логирование
+      // log: ['query', 'info', 'warn', 'error'],
+    });
+  }
+
+  async onModuleInit() {
+    console.log('PrismaService: Connecting to database...');
+    await this.prisma.$connect(); // Соединяемся с базой через внутренний PrismaClient
+    console.log('PrismaService: Database connected.');
+  }
+
+  async onModuleDestroy() {
+    console.log('PrismaService: Disconnecting from database...');
+    await this.prisma.$disconnect(); // Отключаемся
+    console.log('PrismaService: Database disconnected.');
+  }
+
+  // Этот геттер теперь будет возвращать либо tx из ALS, либо внутренний this.prisma
+  get client(): PrismaClient | Prisma.TransactionClient {
+    const store = prismaClientContext.getStore();
+    if (store) {
+      console.log('PrismaService.client: Using transaction client');
+      return store;
+    }
+    console.log('PrismaService.client: Using default Prisma client');
+    // Теперь this.prisma должен быть всегда инициализирован и готов после onModuleInit
+    return this.prisma;
+  }
+
+  // Метод для запуска новой транзакции (остается таким же, но вызываем this.prisma.$transaction)
+  async transaction<T>(callback: () => Promise<T>): Promise<T> {
+    console.log('PrismaService.transaction: Entering interactive transaction.');
+    return this.prisma.$transaction(async (tx) => { // Вызываем $transaction на внутреннем экземпляре
+      console.log('PrismaService.transaction: Transaction client (tx) received from Prisma. Running callback in AsyncLocalStorage context.');
+      try {
+        const result = await prismaClientContext.run(tx, callback);
+        console.log('PrismaService.transaction: Callback executed. Transaction should commit.');
+        return result;
+      } catch (error) {
+        console.error('PrismaService.transaction: Callback failed. Transaction will rollback.', error);
+        throw error;
+      }
+    });
+  }
+
+  async enableShutdownHooks(app: INestApplication) {
+    this.prisma.$on('beforeExit', async () => {
+      await app.close();
+    });
+  }
+}
+
+### Что изменилось и почему это решает проблему:
+
+1. Композиция вместо наследования: PrismaService теперь содержит PrismaClient (через свойство this.prisma), а не является PrismaClient (через extends). Это более гибкий и часто более надежный паттерн.
+2. Явная инициализация: this.prisma = new PrismaClient(...) происходит в конструкторе PrismaService. Это гарантирует, что this.prisma всегда будет полноценным экземпляром PrismaClient после выполнения конструктора.
+3. $connect() на внутреннем экземпляре: Метод onModuleInit вызывает this.prisma.$connect(), что делает this.prisma готовым к запросам.
+4. Безопасный get client(): Теперь, когда нет активной транзакции, get client() просто возвращает this.prisma, который всегда будет полностью инициализированным и готовым к работе PrismaClient после завершения onModuleInit. Проблема с "this is undefined" исчезнет.
+5. $transaction на внутреннем экземпляре: Вызов this.prisma.$transaction также гарантирует, что интерактивная транзакция запускается корректно.
+
+Важно: Убедитесь, что у вас установлен @prisma/adapter-pg и pg пакеты:
+npm install @prisma/adapter-pg pg
+
+Это изменение должно полностью устранить ошибку "Cannot read properties of undefined (reading 'findUnique')" в не-транзакционном контексте и позволит this.prisma.client всегда возвращать корректный клиент, будь то транзакционный или обычный.
+
+
