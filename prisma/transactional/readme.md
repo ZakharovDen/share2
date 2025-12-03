@@ -594,6 +594,9 @@ export class UsersRepository {
 
 Этот подход является рабочим, понятным и не зависит от сложного взаимодействия интерцепторов и AOP. Если проблема с this в PrismaService.client (в не-транзакционном контексте) продолжает быть актуальной, то предложенный костыль с new PrismaClient() внутри геттера client будет обходить эту конкретную проблему, но настоятельно рекомендую все-таки найти её корень.
 
+
+# Решение проблемы с this
+
 Ага! Вот оно что! Это очень важная деталь, которая объясняет проблему с this в не-транзакционном контексте.
 
 Вы используете PrismaPg адаптер. В этом случае, когда вы вызываете super({ adapter }), вы передаете конфигурацию, которая изменяет способ работы базового PrismaClient.
@@ -604,10 +607,10 @@ export class UsersRepository {
   Когда вы делаете extends PrismaClient и передаете конфигурацию в super(), PrismaClient требует асинхронной инициализации для установки соединения и готовности к запросам. Эта инициализация происходит, когда вы вызываете this.$connect() (что вы делаете в onModuleInit).
 
 2. PrismaService.client геттер вызывается раньше, чем onModuleInit завершается в некоторых случаях.
-  •  Когда вы запускаете приложение, PrismaService инстанциируется.
-  •  Его конструктор super({ adapter }) вызывается.
-  •  Затем NestJS вызывает onModuleInit(), где вы делаете await this.$connect().
-  •  Однако, если какой-то код пытается получить this.prismaService.client ДО того, как onModuleInit завершил await this.$connect(), то this еще не будет полностью готов. У него не будет инициализированных прокси-объектов user, post и т.д., потому что $connect еще не выполнился.
+  -  Когда вы запускаете приложение, PrismaService инстанциируется.
+  -  Его конструктор super({ adapter }) вызывается.
+  -  Затем NestJS вызывает onModuleInit(), где вы делаете await this.$connect().
+  -  Однако, если какой-то код пытается получить this.prismaService.client ДО того, как onModuleInit завершил await this.$connect(), то this еще не будет полностью готов. У него не будет инициализированных прокси-объектов user, post и т.д., потому что $connect еще не выполнился.
 
 3. Транзакционный клиент (tx) работает, потому что он создается "по запросу".
   Когда вы вызываете this.$transaction(async (tx) => { ... }), Prisma сама создает tx (клиент транзакции), который уже готов к работе. Он не зависит от состояния this как дефолтного клиента.
@@ -625,7 +628,7 @@ export class UsersRepository {
 ---
 
 ▌Обновленный PrismaService (без наследования PrismaClient):
-
+```ts
 // src/prisma/prisma.service.ts
 import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient, Prisma } from '@prisma/client';
@@ -703,7 +706,7 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     });
   }
 }
-
+```
 ### Что изменилось и почему это решает проблему:
 
 1. Композиция вместо наследования: PrismaService теперь содержит PrismaClient (через свойство this.prisma), а не является PrismaClient (через extends). Это более гибкий и часто более надежный паттерн.
