@@ -720,6 +720,7 @@ npm install @prisma/adapter-pg pg
 
 Это изменение должно полностью устранить ошибку "Cannot read properties of undefined (reading 'findUnique')" в не-транзакционном контексте и позволит this.prisma.client всегда возвращать корректный клиент, будь то транзакционный или обычный.
 
+# Добавление индентификатора транзакции
 
 Отличный вопрос! Вывод идентификатора транзакции для отладки — это стандартная практика. AsyncLocalStorage отлично подходит для этой цели.
 
@@ -727,10 +728,10 @@ npm install @prisma/adapter-pg pg
 
 ---
 
-▌Шаг 1: Добавляем идентификатор в PrismaService
+### Шаг 1: Добавляем идентификатор в PrismaService
 
 Изменим AsyncLocalStorage так, чтобы он хранил объект с клиентом транзакции и уникальным ID.
-
+```ts
 // src/prisma/prisma.service.ts
 import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
 import { PrismaClient, Prisma } from '@prisma/client';
@@ -810,13 +811,13 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
     });
   }
 }
-
+```
 ### Шаг 2: Использование идентификатора для отладки
 
 Теперь в любом месте, где вы используете this.prisma.client или вам нужен transactionId для логирования, вы можете получить его из AsyncLocalStorage.
 
 Пример в репозитории:
-
+```ts
 // src/users/users.repository.ts
 import { Injectable, Inject } from '@nestjs/common';
 import { User, Prisma } from '@prisma/client';
@@ -842,7 +843,9 @@ export class UsersRepository {
   }
   // ...
 }
+```
 Пример в сервисе:
+```ts
 // src/user/user.service.ts
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { UsersRepository } from './users.repository';
@@ -890,6 +893,7 @@ export class UsersService {
     return this.usersRepository.findUserById(id);
   }
 }
+```
 ### Как это работает:
 
 •  Когда вызывается this.prismaService.transaction(), генерируется уникальный transactionId.
