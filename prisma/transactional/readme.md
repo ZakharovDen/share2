@@ -917,6 +917,7 @@ export class UsersService {
 
 ```
 
+# Использование родительской транзакции
 
 Да, именно это и делает предложенное мной обновлённое решение!
 
@@ -926,6 +927,7 @@ export class UsersService {
 Вам нужно, чтобы вложенные вызовы prismaService.transaction() присоединялись к уже существующей родительской транзакции.
 
 Это именно то, что делает модифицированный метод PrismaService.transaction:
+```ts
   async transaction<T>(callback: () => Promise<T>): Promise<T> {
     const existingStore = prismaClientContext.getStore(); // <-- Проверяем, есть ли уже активная транзакция в этом потоке выполнения
 
@@ -952,11 +954,11 @@ export class UsersService {
       });
     }
   }
-
+```
   Пример сценария с вложенными вызовами:
 
 Представим два сервиса: UserService и ProfileService.
-
+```ts
 // src/user/user.service.ts
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
@@ -989,7 +991,8 @@ export class UserService {
     return store ? `TX:${store.transactionId}` : 'NO_TX';
   }
 }
-
+```
+```ts
 // src/profile/profile.service.ts
 import { Injectable } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
@@ -1015,7 +1018,7 @@ export class ProfileService {
     return store ? `TX:${store.transactionId}` : 'NO_TX';
   }
 }
-
+```
 Логи выполнения (пример):
 [TX:abc12de] PrismaService.transaction: Starting new interactive transaction.
 [TX:abc12de] UserService: Создаем пользователя.
