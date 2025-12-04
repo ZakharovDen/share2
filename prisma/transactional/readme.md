@@ -1019,7 +1019,9 @@ export class ProfileService {
   }
 }
 ```
+
 Логи выполнения (пример):
+```
 [TX:abc12de] PrismaService.transaction: Starting new interactive transaction.
 [TX:abc12de] UserService: Создаем пользователя.
 [TX:abc12de] PrismaService.client: Using transaction client
@@ -1030,7 +1032,7 @@ export class ProfileService {
 [TX:abc12de] ProfileService: Профиль создан.
 [TX:abc12de] UserService: Пользователь и профиль созданы.
 [TX:abc12de] PrismaService.transaction: Callback executed. Transaction should commit.
-
+```
 Как видите, вложенный вызов prismaService.transaction в ProfileService не запускает новую интерактивную транзакцию Prisma, а просто выполняет свой callback в контексте уже существующей транзакции (используя тот же txClient и transactionId).
 
 Так что, да, это решение именно то, что вам нужно: всегда выполнять операции в рамках первой начатой транзакции.
