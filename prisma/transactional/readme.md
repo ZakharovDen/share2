@@ -721,3 +721,195 @@ npm install @prisma/adapter-pg pg
 Это изменение должно полностью устранить ошибку "Cannot read properties of undefined (reading 'findUnique')" в не-транзакционном контексте и позволит this.prisma.client всегда возвращать корректный клиент, будь то транзакционный или обычный.
 
 
+Отличный вопрос! Вывод идентификатора транзакции для отладки — это стандартная практика. AsyncLocalStorage отлично подходит для этой цели.
+
+Мы можем добавить уникальный идентификатор для каждой "сессии" AsyncLocalStorage и сохранять его вместе с клиентом транзакции.
+
+---
+
+▌Шаг 1: Добавляем идентификатор в PrismaService
+
+Изменим AsyncLocalStorage так, чтобы он хранил объект с клиентом транзакции и уникальным ID.
+
+// src/prisma/prisma.service.ts
+import { INestApplication, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { PrismaClient, Prisma } from '@prisma/client';
+import { PrismaPg } from '@prisma/adapter-pg';
+import { AsyncLocalStorage } from 'async_hooks';
+import { Pool } from 'pg';
+
+// Определяем интерфейс для нашего хранилища в AsyncLocalStorage
+interface TransactionStore {
+  txClient: Prisma.TransactionClient;
+  transactionId: string; // Уникальный идентификатор транзакции
+}
+
+// Теперь AsyncLocalStorage будет хранить TransactionStore
+export const prismaClientContext = new AsyncLocalStorage<TransactionStore>();
+
+@Injectable()
+export class PrismaService implements OnModuleInit, OnModuleDestroy {
+  private _internalPrismaClient: PrismaClient;
+
+  constructor() {
+    const connectionString = process.env.DATABASE_URL;
+    if (!connectionString) {
+      throw new Error('DATABASE_URL is not set.');
+    }
+    const pool = new Pool({ connectionString });
+    const adapter = new PrismaPg(pool);
+    this._internalPrismaClient = new PrismaClient({ adapter });
+  }
+
+  async onModuleInit() {
+    console.log('PrismaService: Connecting to database...');
+    await this._internalPrismaClient.$connect();
+    console.log('PrismaService: Database connected.');
+  }
+
+  async onModuleDestroy() {
+    console.log('PrismaService: Disconnecting from database...');
+    await this._internalPrismaClient.$disconnect();
+    console.log('PrismaService: Database disconnected.');
+  }
+
+  // Геттер, который теперь возвращает либо txClient, либо _internalPrismaClient
+  get client(): PrismaClient | Prisma.TransactionClient {
+    const store = prismaClientContext.getStore();
+    if (store) {
+      console.log(`[TX:${store.transactionId}] PrismaService.client: Using transaction client`);
+      return store.txClient; // Возвращаем только клиент транзакции
+    }
+    console.log('PrismaService.client: Using default Prisma client');
+    return this._internalPrismaClient;
+  }
+
+  // Метод для запуска транзакции с генерацией ID
+  async transaction<T>(callback: () => Promise<T>): Promise<T> {
+    // Генерируем уникальный ID для этой транзакции
+    const transactionId = Math.random().toString(36).substring(2, 9); // Короткий случайный ID
+    console.log(`[TX:${transactionId}] PrismaService.transaction: Entering interactive transaction.`);
+
+    return this._internalPrismaClient.$transaction(async (txClientFromPrisma) => {
+      console.log(`[TX:${transactionId}] PrismaService.transaction: Transaction client (tx) received from Prisma. Running callback in AsyncLocalStorage context.`);
+      try {
+        // Помещаем в хранилище объект с клиентом и ID
+        const result = await prismaClientContext.run({ txClient: txClientFromPrisma, transactionId }, callback);
+        console.log(`[TX:${transactionId}] PrismaService.transaction: Callback executed. Transaction should commit.`);
+        return result;
+      } catch (error) {
+        console.error(`[TX:${transactionId}] PrismaService.transaction: Callback failed. Transaction will rollback. Error: ${error.message}`, error);
+        throw error;
+      }
+    });
+  }
+
+  async enableShutdownHooks(app: INestApplication) {
+    this._internalPrismaClient.$on('beforeExit', async () => {
+      await app.close();
+    });
+  }
+}
+
+### Шаг 2: Использование идентификатора для отладки
+
+Теперь в любом месте, где вы используете this.prisma.client или вам нужен transactionId для логирования, вы можете получить его из AsyncLocalStorage.
+
+Пример в репозитории:
+
+// src/users/users.repository.ts
+import { Injectable, Inject } from '@nestjs/common';
+import { User, Prisma } from '@prisma/client';
+import { PrismaService, prismaClientContext } from '../prisma/prisma.service'; // Импортируем prismaClientContext
+
+@Injectable()
+export class UsersRepository {
+  constructor(@Inject(PrismaService) private readonly prisma: PrismaService) {}
+
+  private getLogPrefix(): string {
+    const store = prismaClientContext.getStore();
+    return store ? `[TX:${store.transactionId}]` : '[NO_TX]';
+  }
+
+  async createUser(data: Prisma.UserCreateInput): Promise<User> {
+    console.log(`${this.getLogPrefix()} UsersRepository.createUser: Creating user.`);
+    return this.prisma.client.user.create({ data });
+  }
+
+  async findUserById(id: number): Promise<User | null> {
+    console.log(`${this.getLogPrefix()} UsersRepository.findUserById: Finding user by ID: ${id}.`);
+    return this.prisma.client.user.findUnique({ where: { id } });
+  }
+  // ...
+}
+Пример в сервисе:
+// src/user/user.service.ts
+import { Injectable, InternalServerErrorException } from '@nestjs/common';
+import { UsersRepository } from './users.repository';
+import { PrismaService, prismaClientContext } from '../prisma/prisma.service'; // Импортируем prismaClientContext
+
+@Injectable()
+export class UsersService {
+  constructor(
+    private readonly usersRepository: UsersRepository,
+    private readonly prismaService: PrismaService,
+  ) {}
+
+  private getLogPrefix(): string {
+    const store = prismaClientContext.getStore();
+    return store ? `[TX:${store.transactionId}]` : '[NO_TX]';
+  }
+
+  async createUserAndProfile(userData: { name: string; email: string }, profileData: { bio: string }) {
+    console.log(`${this.getLogPrefix()} UserService: Starting createUserAndProfile (explicit transactional)`);
+
+    return this.prismaService.transaction(async () => {
+      // Здесь, внутри callback'а, getLogPrefix() уже будет возвращать ID транзакции
+      console.log(`${this.getLogPrefix()} UserService: Inside transaction callback.`);
+      
+      const user = await this.usersRepository.createUser(userData);
+      console.log(`${this.getLogPrefix()} UserService: User created with ID: ${user.id}`);
+
+      if (userData.email === 'error@example.com') {
+        console.error(`${this.getLogPrefix()} UserService: Simulating an error to trigger rollback.`);
+        throw new InternalServerErrorException('Simulated error during profile creation.');
+      }
+
+      await this.usersRepository.updateUser({
+        where: { id: user.id },
+        data: { name: `${user.name} (Updated)` },
+      });
+      console.log(`${this.getLogPrefix()} UserService: User ${user.id} updated within the same transaction.`);
+
+      return user;
+    });
+  }
+
+  async findUserById(id: number) {
+    console.log(`${this.getLogPrefix()} UserService: Finding user by ID (non-transactional)`);
+    return this.usersRepository.findUserById(id);
+  }
+}
+### Как это работает:
+
+•  Когда вызывается this.prismaService.transaction(), генерируется уникальный transactionId.
+•  Этот transactionId вместе с txClient помещается в AsyncLocalStorage с помощью prismaClientContext.run().
+•  Любой последующий вызов prismaClientContext.getStore() в той же асинхронной цепочке вернет объект { txClient, transactionId }.
+•  Вспомогательная функция getLogPrefix() в каждом сервисе/репозитории позволяет легко получить этот ID и добавить его к логам.
+
+Теперь в логах вы сможете четко видеть, какие операции относятся к какой транзакции, и какие выполняются вне транзакций:
+
+```
+[TX:abc12de] PrismaService.transaction: Entering interactive transaction.
+[TX:abc12de] PrismaService.transaction: Transaction client (tx) received from Prisma. Running callback in AsyncLocalStorage context.
+[TX:abc12de] UserService: Inside transaction callback.
+[TX:abc12de] UsersRepository.createUser: Creating user.
+[TX:abc12de] UserService: User created with ID: 123
+[TX:abc12de] UsersRepository.updateUser: Updating user by ID: 123.
+[TX:abc12de] UserService: User 123 updated within the same transaction.
+[TX:abc12de] PrismaService.transaction: Callback executed. Transaction should commit.
+[NO_TX] UserService: Finding user by ID (non-transactional)
+[NO_TX] UsersRepository.findUserById: Finding user by ID: 456.
+
+```
+
