@@ -917,3 +917,119 @@ export class UsersService {
 
 ```
 
+
+Да, именно это и делает предложенное мной обновлённое решение!
+
+Позвольте мне перефразировать, чтобы было абсолютно ясно:
+
+Вам не нужна "транзакция внутри транзакции" в смысле создания новой, независимой транзакции БД.
+Вам нужно, чтобы вложенные вызовы prismaService.transaction() присоединялись к уже существующей родительской транзакции.
+
+Это именно то, что делает модифицированный метод PrismaService.transaction:
+  async transaction<T>(callback: () => Promise<T>): Promise<T> {
+    const existingStore = prismaClientContext.getStore(); // <-- Проверяем, есть ли уже активная транзакция в этом потоке выполнения
+
+    if (existingStore) {
+      // ***** Сценарий 1: Уже есть активная транзакция *****
+      // Это означает, что текущий вызов `prismaService.transaction()`
+      // происходит внутри callback'а другого, ранее запущенного `prismaService.transaction()`.
+      // В этом случае мы НЕ запускаем новую транзакцию Prisma.
+      // Мы просто выполняем предоставленный `callback` в текущем асинхронном контексте.
+      // Все операции внутри `callback` (которые вызовут `this.prisma.client`)
+      // будут автоматически использовать `existingStore.txClient`, потому что он уже
+      // находится в `AsyncLocalStorage` для этого потока выполнения.
+      console.log(`[TX:${existingStore.transactionId}] PrismaService.transaction: Reusing existing transaction.`);
+      return callback(); // Просто выполняем код, используя уже активную транзакцию.
+    } else {
+      // ***** Сценарий 2: Активной транзакции нет *****
+      // Это означает, что это первый вызов `prismaService.transaction()` в данном потоке выполнения.
+      // Здесь мы запускаем НОВУЮ интерактивную транзакцию Prisma.
+      const transactionId = Math.random().toString(36).substring(2, 9);
+      console.log(`[TX:${transactionId}] PrismaService.transaction: Starting new interactive transaction.`);
+
+      return this._internalPrismaClient.$transaction(async (txClientFromPrisma) => {
+        // ... (код для помещения txClientFromPrisma и transactionId в AsyncLocalStorage и выполнения callback) ...
+      });
+    }
+  }
+
+  Пример сценария с вложенными вызовами:
+
+Представим два сервиса: UserService и ProfileService.
+
+// src/user/user.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { ProfileService } from '../profile/profile.service'; // Предположим, ProfileService
+
+@Injectable()
+export class UserService {
+  constructor(
+    private readonly prismaService: PrismaService,
+    private readonly profileService: ProfileService, // Инжектируем ProfileService
+  ) {}
+
+  async createUserWithProfile(userData: any, profileData: any) {
+    return this.prismaService.transaction(async () => { // <-- Первый вызов transaction()
+      // В этом блоке `transactionId` будет сгенерирован, и `tx` будет помещен в `AsyncLocalStorage`.
+      console.log(`[${this.getLogPrefix()}] UserService: Создаем пользователя.`);
+      const user = await this.prismaService.client.user.create({ data: userData });
+
+      // Здесь вызывается метод другого сервиса, который ТОЖЕ обернут в transaction()
+      console.log(`[${this.getLogPrefix()}] UserService: Вызываем ProfileService.`);
+      const profile = await this.profileService.createProfileForUser(user.id, profileData);
+
+      console.log(`[${this.getLogPrefix()}] UserService: Пользователь и профиль созданы.`);
+      return { user, profile };
+    });
+  }
+
+  private getLogPrefix() {
+    const store = prismaClientContext.getStore();
+    return store ? `TX:${store.transactionId}` : 'NO_TX';
+  }
+}
+
+// src/profile/profile.service.ts
+import { Injectable } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+
+@Injectable()
+export class ProfileService {
+  constructor(private readonly prismaService: PrismaService) {}
+
+  async createProfileForUser(userId: number, profileData: any) {
+    return this.prismaService.transaction(async () => { // <-- Второй, ВЛОЖЕННЫЙ вызов transaction()
+      // Здесь prismaService.transaction проверит `AsyncLocalStorage`.
+      // Он найдет там `tx` от UserService.createUserWithProfile.
+      // Поэтому он НЕ запустит новую транзакцию, а просто выполнит этот callback.
+      console.log(`[${this.getLogPrefix()}] ProfileService: Создаем профиль для пользователя ${userId}.`);
+      const profile = await this.prismaService.client.profile.create({ data: { ...profileData, userId } });
+      console.log(`[${this.getLogPrefix()}] ProfileService: Профиль создан.`);
+      return profile;
+    });
+  }
+
+  private getLogPrefix() {
+    const store = prismaClientContext.getStore();
+    return store ? `TX:${store.transactionId}` : 'NO_TX';
+  }
+}
+
+Логи выполнения (пример):
+[TX:abc12de] PrismaService.transaction: Starting new interactive transaction.
+[TX:abc12de] UserService: Создаем пользователя.
+[TX:abc12de] PrismaService.client: Using transaction client
+[TX:abc12de] UserService: Вызываем ProfileService.
+[TX:abc12de] PrismaService.transaction: Reusing existing transaction. <-- !!! Вот этот лог показывает, что транзакция ПЕРЕИСПОЛЬЗУЕТСЯ !!!
+[TX:abc12de] ProfileService: Создаем профиль для пользователя 1.
+[TX:abc12de] PrismaService.client: Using transaction client
+[TX:abc12de] ProfileService: Профиль создан.
+[TX:abc12de] UserService: Пользователь и профиль созданы.
+[TX:abc12de] PrismaService.transaction: Callback executed. Transaction should commit.
+
+Как видите, вложенный вызов prismaService.transaction в ProfileService не запускает новую интерактивную транзакцию Prisma, а просто выполняет свой callback в контексте уже существующей транзакции (используя тот же txClient и transactionId).
+
+Так что, да, это решение именно то, что вам нужно: всегда выполнять операции в рамках первой начатой транзакции.
+
+
